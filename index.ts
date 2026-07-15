@@ -379,8 +379,13 @@ export default function (pi: ExtensionAPI) {
         }
       };
 
+      // Replace the `$for@<path>` marker with the bare resolved value
+      // (e.g. `<dir>/<child>` or `<line>`). The `$for@` marker is dropped so the
+      // iterated prompts contain only the resolved value — no trace that they
+      // originated from the for command — and so the input handler does not
+      // re-detect `$for@` and re-dispatch the loop on every iteration.
       const replaceToken = (replacement: string) =>
-        plan.text.replace(FOR_TOKEN_RE, `$for@${replacement}`);
+        plan.text.replace(FOR_TOKEN_RE, replacement);
 
       try {
         // Iteration 0 — sent normally, no fork.

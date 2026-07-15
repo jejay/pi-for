@@ -14,9 +14,11 @@ When such a message is submitted, the extension runs a **prompt loop**:
 
 - **Directory** — if the path points to a directory, the loop iterates over all
   of its child elements (files and subdirectories). Each iteration replaces
-  `$for@<dir>` with `$for@<dir>/<child>`.
+  `$for@<dir>` with the bare path `<dir>/<child>` (the `$for@` marker is dropped,
+  so the iterated prompts contain only the resolved path).
 - **File (lines)** — if the path points to a file, the loop iterates over every
-  line of the file. Each iteration replaces `$for@<file>` with `$for@<line>`.
+  line of the file. Each iteration replaces `$for@<file>` with the bare value
+  `<line>` (the `$for@` marker is dropped).
 
 Iterations run strictly sequentially (no parallelism). The first iteration is
 sent as a normal message. Every following iteration **forks** the session from
