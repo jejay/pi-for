@@ -1,0 +1,23 @@
+{
+  "name": "pi-for",
+  "version": "1.0.0",
+  "description": "pi extension: a $for@ prompt-loop editor feature with variable insertion over directory children or file lines.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "prompt-loop",
+    "for-loop"
+  ],
+  "license": "MIT",
+  "main": "index.ts",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
