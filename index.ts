@@ -283,12 +283,17 @@ async function runLoop(
     // for the next iteration — matching pi's documented fork pattern.
     const forkChain = async (i: number, ctx: ExtensionCommandContext) => {
       if (i >= total) return;
-      showHint(i, total, kindLabel, replacements[i]);
 
       const swapped = waitForSessionStart("fork");
       await ctx.fork(preLoopLeafId, {
         position: "at",
         withSession: async (ctx2) => {
+          // We are now inside the freshly forked session (its session_start has
+          // already fired and updated `currentCtx`). Set the hint HERE, on the
+          // new session's UI — not before the fork, or it would be written to
+          // the session that is about to be torn down and never shown.
+          showHint(i, total, kindLabel, replacements[i]);
+
           // ctx2 is a fresh ReplacedSessionContext bound to the newly forked
           // session (its type is inferred from fork()'s withSession signature).
           const wait = waitForSettle();
