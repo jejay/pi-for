@@ -1,16 +1,23 @@
 # pi-for
 
-A [pi](https://github.com/earendil-works/pi) extension that adds a `$for@`
-prompt-loop editor feature with variable insertion.
+A [pi](https://github.com/earendil-works/pi) extension that adds a `/for`
+prompt-loop command with variable insertion over directory children or file
+lines.
 
 ## What it does
 
-While composing a message, write `$for@` (dollar + `for` + at-sign). Vanilla pi
-only opens its fuzzy file/directory search when `@` follows a space; this
-extension additionally opens that **same** fuzzy search when `@` follows
-`$for`. Pick a path and the in-editor command becomes `$for@<file-or-dir>`.
+Compose a message that contains a `$for@<path>` token (dollar + `for` + at-sign
++ a file or directory path), then invoke it as the **`/for` command**:
 
-When such a message is submitted, the extension runs a **prompt loop**:
+```
+/for Please reword the skill in $for@./skills/ and make it more polite
+```
+
+While composing the message, typing `$for@` opens pi's fuzzy file/directory
+search (the same one `@` after a space opens) so you can pick a path. The token
+becomes `$for@<file-or-dir>`.
+
+When the `/for` command runs, it executes a **prompt loop**:
 
 - **Directory** — if the path points to a directory, the loop iterates over all
   of its child elements (files and subdirectories, excluding dotfiles). Each
@@ -21,10 +28,10 @@ When such a message is submitted, the extension runs a **prompt loop**:
   corresponding line.
 
 Iterations run strictly sequentially (no parallelism). The first iteration is
-sent as a normal message. Every following iteration **forks** the session from
-the previous conversation (position `before`) so the previous message is
-replaced while the earlier conversation context is preserved, then sends the
-next replacement.
+sent as a normal message into the *current* (origin) session. Every following
+iteration **forks** the session into a *new session file* so the previous
+iteration's message is replaced while the earlier conversation context is
+preserved, then sends the next replacement.
 
 While the loop runs, a hint is shown in the same region the UI normally uses for
 queued messages, e.g.:
@@ -41,7 +48,7 @@ Given two subdirectories `karate` and `baking` inside `./skills/`:
 ```
 User:  Have a look at the readme
 Pi:    (acknowledges)
-User:  Please reword the skill in $for@./skills/ and make it more polite
+User:  /for Please reword the skill in $for@./skills/ and make it more polite
 ```
 
 This expands to:
@@ -49,21 +56,31 @@ This expands to:
 ```
 User:  Please reword the skill in ./skills/karate/ and make it more polite
        ... (wait for answer) ...
-       fork → replace last message
+       fork → replace last message (new session file)
 User:  Please reword the skill in ./skills/baking/ and make it more polite
 ```
 
+The origin session keeps the first iteration; each subsequent iteration lives in
+its own forked session file, so the session list shows one session per
+iteration.
+
 ## Design notes
 
-- This is an **editor feature, not a slash command** — no command is registered.
-  The loop is driven entirely from the `input` event handler.
-- The **fork semantic is required, but the `/fork` command is not used**. The
-  fork is re-implemented at a lower level by calling `SessionManager.branch()` to
-  move the active leaf back to the pre-loop conversation, then
-  `pi.sendUserMessage()` to append the next iteration as a fresh branch. This
-  reproduces the fork behaviour (each iteration has the same base context; the
-  previous iteration's message is replaced) without switching session files and
-  without any slash command.
+- This is driven by a real registered command, **`/for`**. The fork semantic
+  requires `ctx.fork()`, which is only available on `ExtensionCommandContext`
+  (the context passed to command handlers) — `ExtensionContext` (used by the
+  `input`/`session_start` handlers) does not expose it. So the loop runs inside
+  the `/for` command handler, where `cmdCtx.fork()` is available.
+- The submitted message must start with `/for` so that pi's command pipeline
+  routes it to the handler. A bare `$for@<path>` message submitted as a normal
+  message is not a command and is intercepted with a hint to use `/for`.
+- **Why the old approach failed:** `ExtensionAPI.sendUserMessage()` internally
+  calls `prompt(text, { expandPromptTemplates: false, … })`, and pi only runs
+  slash/extension commands when `expandPromptTemplates` is true. So sending
+  `"/clone"` via `sendUserMessage` never executed the command — it was just
+  appended as a literal user message into the *same* session, which is why every
+  iteration chained linearly into one session. The fix uses the real
+  `ctx.fork()` instead.
 - The `$for@` fuzzy search reuses pi's built-in fuzzy file/directory provider
   (`CombinedAutocompleteProvider.getFuzzyFileSuggestions`) via a wrapping
   `AutocompleteProvider`, with a `readdir` fallback. The editor is extended so

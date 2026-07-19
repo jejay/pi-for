@@ -1,16 +1,20 @@
 /**
- * pi-for — a pi extension that adds a `$for@` prompt-loop editor feature.
+ * pi-for — a pi extension that adds a `/for` prompt-loop command with variable
+ * insertion.
  *
  * ---------------------------------------------------------------------------
  * What it does
  * ---------------------------------------------------------------------------
- * While composing a message you can write `$for@` (dollar + "for" + at-sign).
- * Vanilla pi only opens its fuzzy file/directory search when `@` follows a
- * space. This extension additionally opens that *same* fuzzy search when `@`
- * follows `$for`. Pick a path and the in-editor command becomes
- * `$for@<file-or-dir>`.
+ * Write a message that contains `$for@<path>` (dollar + "for" + at-sign +
+ * a file or directory path), then invoke it as the `/for` command, e.g.:
  *
- * When such a message is submitted, the extension runs a *prompt loop*:
+ *     /for Please reword the skill in $for@./skills/ and make it more polite
+ *
+ * While composing the message, typing `$for@` opens pi's fuzzy file/directory
+ * search (the same one `@` after a space opens) so you can pick a path. The
+ * in-editor command becomes `$for@<file-or-dir>`.
+ *
+ * When the `/for` command runs, it executes a *prompt loop*:
  *
  *   - If the path points to a DIRECTORY, the loop iterates over every child
  *     element (files and subdirectories, excluding dotfiles). Each iteration
@@ -21,24 +25,27 @@
  *     corresponding line.
  *
  * Iterations are strictly sequential (no parallelism). The first iteration is
- * sent as a normal message. Every following iteration *forks* the session from
- * the previous conversation (position "before") so that the previous message is
- * replaced while the earlier conversation context is preserved, then sends the
- * next replacement. While the loop runs, a hint is shown in the same region the
- * UI normally uses for queued messages.
+ * sent as a normal message into the *current* (origin) session. Every following
+ * iteration **forks** the session from the message that preceded the loop, so
+ * each iteration lives in its own session file (the fork semantic: the origin
+ * survives with the first message, and every following iteration keeps the same
+ * base context while the previous iteration's session is replaced). While the
+ * loop runs, a hint is shown in the same region the UI normally uses for queued
+ * messages.
  *
  * ---------------------------------------------------------------------------
  * Implementation notes
  * ---------------------------------------------------------------------------
- * - This is an *editor* feature, not a slash command. No command is registered.
- *   The loop is driven entirely from the `input` event handler.
- * - The fork semantic is a hard requirement, but the `/fork` *command* is not
- *   used. Instead the fork is re-implemented at a lower level by calling
- *   `SessionManager.branch()` to move the active leaf back to the pre-loop
- *   conversation, then `pi.sendUserMessage()` to append the next iteration as a
- *   fresh branch. This reproduces the fork/clone behaviour (each iteration has
- *   the same base context; the previous iteration's message is replaced) without
- *   switching session files and without any slash command.
+ * - This is driven by a real registered command (`/for`). The fork is a hard
+ *   requirement, and `ctx.fork()` is only available on `ExtensionCommandContext`
+ *   (the context passed to command handlers) — `ExtensionContext` (used by the
+ *   `input`/`session_start` handlers) does not expose it. So the loop runs
+ *   inside the `/for` command handler, where `cmdCtx.fork()` is available.
+ * - `ExtensionAPI.sendUserMessage()` intentionally skips command handling
+ *   (`expandPromptTemplates: false`), so the old approach of
+ *   `sendUserMessage("/clone")` could never fork — `/clone` was just appended
+ *   as a literal message into the same session. That is why the loop previously
+ *   chained every iteration into one session. We now use the real `ctx.fork()`.
  * - The `$for@` fuzzy search reuses pi's built-in fuzzy file/directory provider
  *   (`CombinedAutocompleteProvider.getFuzzyFileSuggestions`) via a wrapping
  *   `AutocompleteProvider`, plus a `readdir` fallback. The editor is extended so
@@ -47,7 +54,7 @@
 
 import type {
   ExtensionAPI,
-  ExtensionContext,
+  ExtensionCommandContext,
   InputEvent,
   InputEventResult,
 } from "@earendil-works/pi-coding-agent";
@@ -74,32 +81,19 @@ const FOR_BARE_RE = /\$for@(?=\s|$)/;
 
 const WIDGET_KEY = "pi-for";
 
-/** Lower-level SessionManager methods used to re-implement the fork. */
-interface BranchableSessionManager {
-  getLeafId(): string | null;
-  branch(branchFromId: string): void;
-  resetLeaf(): void;
-}
-
-interface LoopPlan {
-  /** Original message text that contains the `$for@<path>` token. */
-  text: string;
-  /** Working directory at submit time. */
-  cwd: string;
-  /** Path captured from the `$for@<path>` token. */
-  tokenPath: string;
-  /** Leaf id of the last message before the for-loop started. */
-  preLoopLeafId: string | null;
-}
-
 // ---------------------------------------------------------------------------
 // Module-level state
 // ---------------------------------------------------------------------------
 
 let wordCwd = process.cwd();
 let loopRunning = false;
+/** Latest session context. Updated on every session_start so the loop can act
+ * on the *current* session after a fork switches the active runtime. */
+let currentCtx: ExtensionCommandContext | null = null;
 /** Resolvers for pending "wait until the agent has settled" promises. */
 let settleWaiters: Array<() => void> = [];
+/** Resolvers for pending session_start events, keyed by reason. */
+let sessionStartWaiters: Array<(reason: string) => void> = [];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -172,76 +166,160 @@ function waitForSettle(): Promise<void> {
   });
 }
 
+/**
+ * Resolve on the next `session_start` whose reason matches. Used to detect when
+ * a fork has switched the active session to the new file.
+ * A timeout safety net prevents the loop from hanging if the switch never fires.
+ */
+function waitForSessionStart(reason: string, timeoutMs = 30000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (r: string) => {
+      if (done || r !== reason) return;
+      done = true;
+      cleanup();
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(new Error("session switch did not complete in time"));
+    }, timeoutMs);
+    const cleanup = () => clearTimeout(timer);
+    sessionStartWaiters.push(finish);
+  });
+}
+
+/** Current UI context, preferring the live (post-fork) session context. */
+function ui() {
+  return currentCtx?.ui;
+}
+
 // ---------------------------------------------------------------------------
-// The for-loop, driven from the `input` handler (no slash command).
+// The for-loop, driven from the `/for` command handler (has ctx.fork()).
 // ---------------------------------------------------------------------------
 
 async function runLoop(
   pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  plan: LoopPlan,
+  args: string,
+  cmdCtx: ExtensionCommandContext,
 ): Promise<void> {
+  if (loopRunning) {
+    cmdCtx.ui.notify("pi-for: a for-loop is already running", "warning");
+    return;
+  }
   loopRunning = true;
-  const sm = ctx.sessionManager as unknown as BranchableSessionManager;
+
   const showHint = (i: number, total: number, kindLabel: string, value: string) => {
-    if (!ctx.hasUI) return;
-    ctx.ui.setWidget(WIDGET_KEY, [
+    if (!ui()) return;
+    ui()!.setWidget(WIDGET_KEY, [
       `for-loop · ${i + 1}/${total} · ${kindLabel}`,
       `↳ ${truncate(value)}`,
     ]);
   };
   const clearHint = () => {
-    if (!ctx.hasUI) return;
+    if (!ui()) return;
     try {
-      ctx.ui.setWidget(WIDGET_KEY, undefined);
+      ui()!.setWidget(WIDGET_KEY, undefined);
     } catch {
       /* ignore */
     }
   };
 
   try {
+    const m = args.match(FOR_TOKEN_RE);
+    if (!m) {
+      cmdCtx.ui.notify(
+        "pi-for: no $for@<path> token found. Example: /for Review $for@./src/",
+        "error",
+      );
+      return;
+    }
+    const tokenPath = m[1];
+
     let parsed: ReturnType<typeof buildReplacements>;
     try {
-      parsed = buildReplacements(plan.tokenPath, plan.cwd);
+      parsed = buildReplacements(tokenPath, cmdCtx.cwd);
     } catch (err) {
-      ctx.ui.notify(`pi-for: ${err instanceof Error ? err.message : String(err)}`, "error");
+      cmdCtx.ui.notify(
+        `pi-for: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
       return;
     }
 
     const { kindLabel, replacements } = parsed;
     const total = replacements.length;
     if (total === 0) {
-      ctx.ui.notify(`pi-for: no iterations found for ${plan.tokenPath}`, "warning");
+      cmdCtx.ui.notify(`pi-for: no iterations found for ${tokenPath}`, "warning");
       return;
     }
 
+    // The leaf of the conversation that existed *before* the loop started. Every
+    // subsequent iteration forks from this point, so each forked session keeps
+    // only this base context plus a single iteration. Capture it now, before we
+    // send iteration 0 (which would otherwise advance the leaf past it).
+    const preLoopLeafId = cmdCtx.sessionManager.getLeafId();
+
     // Replace the *full* `$for@<path>` token (not just the path) with the value.
     const replaceToken = (replacement: string) =>
-      plan.text.replace(FOR_TOKEN_RE, replacement);
+      args.replace(FOR_TOKEN_RE, replacement);
 
-    // Iteration 0 — sent normally, no fork (the leaf is already the pre-loop
-    // conversation, so this simply continues from it).
-    showHint(0, total, kindLabel, replacements[0]);
-    {
+    // Send a message and wait for the agent to fully settle.
+    const sendAndWait = async (value: string) => {
       const wait = waitForSettle();
-      pi.sendUserMessage(replaceToken(replacements[0]));
+      pi.sendUserMessage(replaceToken(value));
       await wait;
+    };
+
+    // Iteration 0 — sent into the current (origin) session, no fork. The origin
+    // thereby survives with this first message (fork semantic).
+    showHint(0, total, kindLabel, replacements[0]);
+    await sendAndWait(replacements[0]);
+
+    // No base message to fork from (empty session): degrade to plain sequential
+    // sends rather than throwing inside the fork call.
+    if (!preLoopLeafId || typeof cmdCtx.fork !== "function") {
+      if (!preLoopLeafId) {
+        cmdCtx.ui.notify(
+          "pi-for: no base message to fork from; sending remaining iterations sequentially",
+          "warning",
+        );
+      } else {
+        cmdCtx.ui.notify(
+          "pi-for: fork is unavailable in this mode; sending remaining iterations sequentially",
+          "warning",
+        );
+      }
+      for (let i = 1; i < total; i++) {
+        showHint(i, total, kindLabel, replacements[i]);
+        await sendAndWait(replacements[i]);
+      }
+      return;
     }
 
-    // Iterations 1..N-1 — re-implement the fork: move the active leaf back to
-    // the pre-loop conversation, then append the next iteration as a fresh
-    // branch. The previous iteration's message is thereby replaced while the
-    // earlier conversation context is preserved.
+    // Iterations 1..N-1 — fork into a *new session file* each time (so the
+    // session list shows one session per iteration). `ctx.fork()` switches the
+    // active runtime to a fresh session file containing only the pre-loop
+    // conversation (branched "at" the pre-loop leaf). The previous iteration's
+    // session is replaced while every iteration keeps the same base context.
     for (let i = 1; i < total; i++) {
-      if (plan.preLoopLeafId) sm.branch(plan.preLoopLeafId);
-      else sm.resetLeaf();
       showHint(i, total, kindLabel, replacements[i]);
-      const wait = waitForSettle();
-      pi.sendUserMessage(replaceToken(replacements[i]));
-      await wait;
+
+      const swapped = waitForSessionStart("fork");
+      const result = await cmdCtx.fork(preLoopLeafId, { position: "at" });
+      if (result.cancelled) {
+        cmdCtx.ui.notify("pi-for: fork cancelled; stopping loop", "warning");
+        return;
+      }
+      // Wait until the runtime has actually switched to the new session file.
+      await swapped;
+
+      await sendAndWait(replacements[i]);
     }
   } catch (err) {
-    ctx.ui.notify(
+    cmdCtx.ui.notify(
       `pi-for: loop error: ${err instanceof Error ? err.message : String(err)}`,
       "error",
     );
@@ -443,18 +521,35 @@ class ForEditor extends CustomEditor {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  // Open the fuzzy search for `$for@` and handle the loop. Registered once.
+  // Register the `/for` command. Command handlers receive an
+  // `ExtensionCommandContext` that exposes `ctx.fork()`, which is what makes
+  // the per-iteration fork into separate session files possible.
+  pi.registerCommand("for", {
+    description:
+      "Run a prompt loop: fork a new session per iteration over a directory or file referenced by a $for@<path> token.",
+    handler: async (args: string, cmdCtx: ExtensionCommandContext) => {
+      await runLoop(pi, args, cmdCtx);
+    },
+  });
+
+  // Wrap the active autocomplete provider so `$for@` opens the file search, and
+  // extend the editor so typing `$for@` triggers the search. The wrapper list is
+  // reset on every session rebind (including forks), so re-wrapping here is safe
+  // and never nests.
   pi.on("session_start", (_event, ctx) => {
     wordCwd = ctx.cwd;
-    // Wrap the active autocomplete provider so `$for@` opens the file search.
+    currentCtx = ctx as ExtensionCommandContext;
     ctx.ui.addAutocompleteProvider(
       (current) => new ForAutocompleteProvider(current, () => wordCwd),
     );
-    // Extend the editor so typing `$for@` triggers the search.
     ctx.ui.setEditorComponent(
       (tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager): EditorComponent =>
         new ForEditor(tui, theme, keybindings),
     );
+    // Notify any pending loop that the session switched (e.g. after a fork).
+    const waiters = sessionStartWaiters;
+    sessionStartWaiters = [];
+    for (const w of waiters) w(_event.reason);
   });
 
   // Resolve any pending "wait for the agent to settle" promises.
@@ -464,40 +559,34 @@ export default function (pi: ExtensionAPI) {
     for (const w of waiters) w();
   });
 
-  // Drop any in-flight loop state when the session ends.
+  // Drop in-flight waiters when the session ends. Note: during a fork the
+  // old session's `session_shutdown` fires *before* the new session's
+  // `session_start`, so we must NOT clear `sessionStartWaiters` here (that would
+  // orphan a pending fork-wait) and must NOT reset `currentCtx`/`loopRunning`
+  // (the loop continues in the forked session).
   pi.on("session_shutdown", () => {
-    loopRunning = false;
     settleWaiters = [];
   });
 
-  // Detect a submitted message that contains `$for@<path>` and run the loop.
-  // We only act on user-typed / RPC input; messages we inject ourselves
-  // (source === "extension") are ignored so the loop never re-triggers itself.
+  // Guard against the old `$for@`-as-a-plain-message syntax. A `$for@<path>`
+  // token only works inside the `/for` command now; if a user submits it as a
+  // normal message we explain the new invocation instead of silently sending an
+  // unresolved token to the model.
   pi.on("input", (event, ctx): InputEventResult | void => {
     if (event.source === "extension") return { action: "continue" };
 
     const text = event.text;
+    // The `/for` command is handled by the command pipeline, not here.
+    if (text.startsWith("/for")) return { action: "continue" };
+
     if (FOR_TOKEN_RE.test(text)) {
-      // A `$for@<path>` token is present — run the loop.
-      if (loopRunning) {
-        ctx.ui.notify("pi-for: a for-loop is already running", "warning");
-        return { action: "handled" };
-      }
-
-      const m = text.match(FOR_TOKEN_RE)!;
-      const plan: LoopPlan = {
-        text,
-        cwd: ctx.cwd,
-        tokenPath: m[1],
-        preLoopLeafId: ctx.sessionManager.getLeafId(),
-      };
-
-      // Swallow the original message and drive the loop asynchronously.
-      void runLoop(pi, ctx, plan);
+      ctx.ui.notify(
+        "pi-for: use the /for command — e.g. /for Review $for@./src/",
+        "warning",
+      );
       return { action: "handled" };
     }
 
-    // `$for@` present but with no path attached — it needs a path.
     if (FOR_BARE_RE.test(text)) {
       ctx.ui.notify("pi-for: $for@ needs a file or directory path", "warning");
       return { action: "handled" };
