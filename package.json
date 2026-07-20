@@ -1,7 +1,7 @@
 {
   "name": "pi-for",
   "version": "1.0.0",
-  "description": "pi extension: a $for@ prompt-loop editor feature with variable insertion over directory children or file lines.",
+  "description": "pi extension: a $each@ prompt-loop editor feature with variable insertion over directory children or file lines.",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -10,10 +10,27 @@
     "for-loop"
   ],
   "license": "MIT",
+  "author": "jejay",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jejay/pi-for.git"
+  },
+  "homepage": "https://github.com/jejay/pi-for#readme",
   "main": "index.ts",
+  "files": [
+    "index.ts",
+    "README.md",
+    "pi-for-preview.png",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/jejay/pi-for/main/pi-for-preview.png"
   }
 }
