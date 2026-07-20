@@ -4,6 +4,10 @@ A [pi](https://github.com/earendil-works/pi) extension that adds a `/for`
 prompt-loop command with variable insertion over directory children or file
 lines.
 
+## Why
+
+Like subagents but much simpler, sequential and with more control for the user. Instead of describing the loop to the agent, just make a loop. No need to tell the agent about your control structure if you already know the control structure.
+
 ## Demo
 
 ![](https://raw.githubusercontent.com/jejay/pi-for/main/demo-imgs/pi-for-demo-1.png)
