@@ -108,10 +108,10 @@ iteration.
 ## Install
 
 ```bash
-pi install git:github.com/jejay/pi-for
+pi install npm:pi-for
 ```
 
-Or try it without installing:
+To try it without installing (from a clone):
 
 ```bash
 pi -e ./index.ts
